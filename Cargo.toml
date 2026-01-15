@@ -1,0 +1,9 @@
+[package]
+name = "rusqlite-async"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-channel = "2.5.0"
+rusqlite = "0.38.0"
+tokio = "1.49.0"
