@@ -2,7 +2,11 @@
 name = "rusqlite-async"
 version = "0.1.0"
 edition = "2024"
+description = "Async wrapper over rusqlite powered by async channels."
+license = "Apache-2.0"
 repository = "https://github.com/hchap1/rusqlite-async"
+keywords = ["async", "sql", "sqlite", "rusqlite"]
+categories = ["database"]
 
 [dependencies]
 async-channel = "2.5.0"
