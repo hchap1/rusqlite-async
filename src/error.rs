@@ -5,6 +5,7 @@ use async_channel::TryRecvError;
 
 pub type Res<T> = Result<T, Error>;
 type StdIoError = std::io::Error;
+type RusqliteError = rusqlite::Error;
 
 macro_rules! error_enum {
     (
@@ -62,5 +63,6 @@ error_enum! {
     pub enum Error {
         StdIoError,
         ChannelError,
+        RusqliteError
     }
 }
