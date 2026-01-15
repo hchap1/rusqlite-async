@@ -2,6 +2,7 @@
 name = "rusqlite-async"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/hchap1/rusqlite-async"
 
 [dependencies]
 async-channel = "2.5.0"

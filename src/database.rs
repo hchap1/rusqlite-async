@@ -12,24 +12,43 @@ use rusqlite::params_from_iter;
 use rusqlite::ParamsFromIter;
 use rusqlite::types::ValueRef;
 
-use super::error::ResonateError;
+use crate::error::ChannelError;
+use crate::error::Error;
+use crate::error::Res;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ItemStream {
     Value(Vec<DatabaseParam>),
-    Error,
+    Error(Error),
     End
 }
 
+#[derive(Debug, Clone)]
 pub enum InsertMessage {
+    // The new row ID, number of rows modified
+    Success(usize, usize),
+    Error(Error)
+}
+
+#[derive(Debug, Clone)]
+pub enum ExecuteMessage {
+    // Number of rows modified
     Success(usize),
-    Error
+    Error(Error)
 }
 
 pub enum DatabaseTask {
+
+    // Cast off an execute request without waiting for it to finish or checking the result
     Execute(&'static str, DatabaseParams),
-    WaitExecute(&'static str, DatabaseParams, Sender<()>),
+
+    // Send an execute request and schedule a callback for the result
+    WaitExecute(&'static str, DatabaseParams, Sender<ExecuteMessage>),
+
+    // Send an insert request and schedule a callback for the new ID
     Insert(&'static str, DatabaseParams, Sender<InsertMessage>),
+
+    // Create a query request, echoes results back to the caller
     Query(&'static str, DatabaseParams, Sender<ItemStream>),
 }
 
@@ -92,77 +111,86 @@ impl DataLink {
         DataLink { task_sender }
     }
 
-    pub fn execute(&self, query: &'static str, params: DatabaseParams) -> Result<(), ()> {
-        self.task_sender.send_blocking(DatabaseTask::Execute(query, params)).map_err(|_| ())
+    pub fn execute(&self, query: &'static str, params: DatabaseParams) -> Res<()> {
+        self.task_sender.send_blocking(DatabaseTask::Execute(query, params)).map_err(ChannelError::from)?;
+        Ok(())
     }
 
-    pub async fn execute_and_wait(&self, query: &'static str, params: DatabaseParams) -> Result<(), ()> {
+    /// Execute the query and wait for the result. Upon succes, returns the number of affected rows.
+    pub async fn execute_and_wait(&self, query: &'static str, params: DatabaseParams) -> Res<usize> {
+
         let (sender, receiver) = unbounded();
-        let _ = self.task_sender.send_blocking(DatabaseTask::WaitExecute(query, params, sender));
+        self.task_sender.send(DatabaseTask::WaitExecute(query, params, sender)).await.map_err(ChannelError::from)?;
+
         match receiver.recv().await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(())
+            Ok(execute_message) => match execute_message {
+                ExecuteMessage::Success(rows_modified) => Ok(rows_modified),
+                ExecuteMessage::Error(e) => Err(e)
+            },
+            Err(e) => Err(ChannelError::from(e).into())
         }
     }
 
     /// Execute function with receiver callback intended for insert commands (returns row id)
-    pub async fn insert(&self, query: &'static str, params: DatabaseParams) -> Option<usize> {
+    pub async fn insert(&self, query: &'static str, params: DatabaseParams) -> Res<(usize, usize)> {
         let (sender, receiver) = unbounded();
-        let _ = self.task_sender.send_blocking(DatabaseTask::Insert(query, params, sender));
+        self.task_sender.send(DatabaseTask::Insert(query, params, sender)).await.map_err(ChannelError::from)?;
+
         let result = match receiver.recv().await {
             Ok(result) => result,
-            Err(_) => return None
+            Err(e) => return Err(ChannelError::from(e).into())
         };
 
-        match result { InsertMessage::Success(v) => Some(v), InsertMessage::Error => None }
+        match result {
+            InsertMessage::Success(v, n) => Ok((v, n)),
+            InsertMessage::Error(e) => Err(e)
+        }
     }
 
-    pub fn insert_stream(&self, query: &'static str, params: DatabaseParams) -> Receiver<InsertMessage> {
+    pub fn insert_stream(&self, query: &'static str, params: DatabaseParams) -> Res<Receiver<InsertMessage>> {
         let (sender, receiver) = unbounded();
-        let _ = self.task_sender.send_blocking(DatabaseTask::Insert(query, params, sender));
-        receiver
+        self.task_sender.send_blocking(DatabaseTask::Insert(query, params, sender)).map_err(ChannelError::from)?;
+        Ok(receiver)
     }
 
-    /// Return a receiver that receives the rows
-    pub fn query_stream(&self, query: &'static str, params: DatabaseParams) -> Receiver<ItemStream> {
+    /// Return a receiver that receives the rows directly. Unblocking.
+    pub fn query_stream(&self, query: &'static str, params: DatabaseParams) -> Res<Receiver<ItemStream>> {
         let (sender, receiver) = unbounded();
-        let _ = self.task_sender.send_blocking(DatabaseTask::Query(query, params, sender));
-        receiver
+        self.task_sender.send_blocking(DatabaseTask::Query(query, params, sender)).map_err(ChannelError::from)?;
+        Ok(receiver)
     }
 
     /// Collect all results, then proceed
     pub async fn query_map(
         &self, query: &'static str, params: DatabaseParams
-    ) -> Result<Vec<Vec<DatabaseParam>>, ResonateError> {
+    ) -> Res<Vec<Vec<DatabaseParam>>> {
         let (sender, receiver) = unbounded();
-        let _ = self.task_sender.send_blocking(DatabaseTask::Query(query, params, sender));
+        self.task_sender.send(DatabaseTask::Query(query, params, sender)).await.map_err(ChannelError::from)?;
 
         let mut values = Vec::new();
-        let mut error = false;
+
         while let Ok(item) = receiver.recv().await {
             match item {
                 ItemStream::End => break,
-                ItemStream::Error => { error = true; break },
+                ItemStream::Error(e) => return Err(e),
                 ItemStream::Value(v) => values.push(v)
             };
         }
 
-        match error {
-            false => Ok(values),
-            true => Err(ResonateError::GenericError)
-        }
+        Ok(values)
     }
 }
 
 impl Database {
-    pub fn new(root_dir: PathBuf) -> Database {
+    pub fn new(root_dir: PathBuf) -> (Database, Receiver<Error>) {
 
+        let (error_sender, error_receiver) = unbounded();
         let (task_sender, task_receiver) = unbounded();
 
-        Database {
-            _handle: spawn(move || database_thread(root_dir, task_receiver)),
+        (Database {
+            _handle: spawn(move || database_thread(root_dir, task_receiver, error_sender)),
             datalink: DataLink::new(task_sender)
-        }
+        }, error_receiver)
     }
 
     pub fn derive(&self) -> DataLink {
@@ -170,7 +198,7 @@ impl Database {
     }
 }
 
-fn database_thread(root_dir: PathBuf, task_receiver: Receiver<DatabaseTask>) {
+fn database_thread(root_dir: PathBuf, task_receiver: Receiver<DatabaseTask>, error_sender: Sender<Error>) {
 
     let connection = match Connection::open(root_dir.join("data.db")) {
         Ok(connection) => connection,
@@ -184,32 +212,76 @@ fn database_thread(root_dir: PathBuf, task_receiver: Receiver<DatabaseTask>) {
         };
 
         match current_task {
+
+            // Do not check return.
             DatabaseTask::Execute(query, params) => {
                 if let Ok(mut statement) = connection.prepare(query) {
-                    let _ = statement.execute(params.to_params());
+                    let res = statement.execute(params.to_params());
+                    if res.is_err() {
+                        println!("Execution of SQL query failed. Unable to execute query: {query}");
+                    }
+                } else {
+                    eprintln!("Execution of SQL query failed. Unable to prepare query.");
                 }
             },
+
             DatabaseTask::WaitExecute(query, params, sender) => {
-                if let Ok(mut statement) = connection.prepare(query) {
-                    let _ = statement.execute(params.to_params());
-                    let _ = sender.send_blocking(());
-                } else {
-                    let _ = sender.send_blocking(());
+
+                if let Err(e) = match connection.prepare(query) {
+                    Ok(mut statement) => {
+                        match statement.execute(params.to_params()) {
+                            Ok(rows_modified) => sender.send_blocking(ExecuteMessage::Success(rows_modified)).map_err(ChannelError::from),
+                            Err(e) => sender.send_blocking(ExecuteMessage::Error(e.into())).map_err(ChannelError::from)
+                        }
+                    },
+                    Err(e) => sender.send_blocking(ExecuteMessage::Error(e.into())).map_err(ChannelError::from)
+                } {
+                    match error_sender.send_blocking(e.into()) {
+                        Ok(_) => {},
+                        Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                    }
                 }
             },
+
             DatabaseTask::Insert(query, params, sender) => {
-                if let Ok(mut statement) = connection.prepare(query) {
-                    let _ = statement.execute(params.to_params());
-                    let _ = sender.send_blocking(InsertMessage::Success(connection.last_insert_rowid() as usize));
-                } else {
-                    let _ = sender.send_blocking(InsertMessage::Error);
+                match connection.prepare(query) {
+                    Ok(mut statement) => {
+                        let res = statement.execute(params.to_params());
+                        if let Err(e) = match res {
+                            Ok(rows_modified) => {
+                                let new_id = connection.last_insert_rowid() as usize;
+                                sender.send_blocking(InsertMessage::Success(new_id, rows_modified)).map_err(ChannelError::from)
+                            },
+
+                            Err(e) => sender.send_blocking(InsertMessage::Error(e.into())).map_err(ChannelError::from)
+                        } {
+                            match error_sender.send_blocking(e.into()) {
+                                Ok(_) => {},
+                                Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                            }
+                        }
+                    }
+                    Err(e) => {
+
+                        if let Err(e) = sender.send_blocking(InsertMessage::Error(e.into())).map_err(ChannelError::from) {
+                            match error_sender.send_blocking(e.into()) {
+                                Ok(_) => {},
+                                Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                            }
+                        }
+                    }
                 }
             }
             DatabaseTask::Query(query, params, sender) => {
                 let mut statement = match connection.prepare(query) {
                     Ok(statement) => statement,
-                    Err(_) => {
-                        let _ = sender.send_blocking(ItemStream::Error);
+                    Err(e) => {
+                        if let Err(e) = sender.send_blocking(ItemStream::Error(e.into())).map_err(ChannelError::from) {
+                            match error_sender.send_blocking(e.into()) {
+                                Ok(_) => {},
+                                Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                            }
+                        }
                         continue
                     }
                 };
@@ -239,16 +311,32 @@ fn database_thread(root_dir: PathBuf, task_receiver: Receiver<DatabaseTask>) {
                     else { Err(rusqlite::Error::QueryReturnedNoRows) }
                 }) {
                     Ok(rows) => rows.filter_map(|x| x.ok()).collect::<Vec<Vec<DatabaseParam>>>(),
-                    Err(_) => {
-                        let _ = sender.send_blocking(ItemStream::Error);
+                    Err(e) => {
+                        if let Err(e) = sender.send_blocking(ItemStream::Error(e.into())).map_err(ChannelError::from) {
+                            match error_sender.send_blocking(e.into()) {
+                                Ok(_) => {},
+                                Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                            }
+                        }
                         continue 'mainloop
                     }
                 };
 
                 for row in rows {
-                    let _ = sender.send_blocking(ItemStream::Value(row));
+                    if let Err(e) = sender.send_blocking(ItemStream::Value(row)).map_err(ChannelError::from) {
+                        match error_sender.send_blocking(e.into()) {
+                            Ok(_) => {},
+                            Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                        }
+                    }
                 }
-                let _ = sender.send_blocking(ItemStream::End);
+
+                if let Err(e) = sender.send_blocking(ItemStream::End).map_err(ChannelError::from) {
+                    match error_sender.send_blocking(e.into()) {
+                        Ok(_) => {},
+                        Err(e) => eprintln!("Unable to report error: {e:?}. Ensure error receiver is not dropped.")
+                    }
+                }
             }
         }
     }
